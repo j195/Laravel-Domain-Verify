@@ -4,6 +4,8 @@ Laravel + React (Inertia) app for blacklist/DNS checks and Google Workspace / Mi
 
 Use this file if you are setting the project up on a new local machine.
 
+Design notes for reviewers (architecture, stack, bulk/concurrency, DNS retries, provider detection, production follow-ups) are at the **end of this file**.
+
 ---
 
 ## Required software versions
@@ -442,3 +444,154 @@ domain
 gmail.com
 user@outlook.com
 ```
+
+---
+
+## Overall architecture
+
+Mailin is a **monolith**: one Laravel app serves HTML (Inertia) and JSON APIs. There is no separate React SPA or Node API.
+
+```text
+Browser (React + Inertia)
+    │  login, tool pages
+    │  POST /checks/single  (one domain, wait for result)
+    │  POST /checks/bulk    (parse file, create batch + rows)
+    │  POST /batches/{id}/tick     (process one domain, return table)
+    │  POST /batches/{id}/handoff  (tab closed → queue)
+    ▼
+Laravel (PHP 8.3, auth, validation, MySQL)
+    │
+    ├─ DomainNormalizer     emails/URLs → host
+    ├─ DnsLookupService     MX, SPF, DKIM, DMARC, A/AAAA, NS, PTR, TXT
+    ├─ BlacklistService     IP DNSBLs + domain/URI lists
+    ├─ MailProviderDetector Google Workspace / Microsoft 365 / Other / Not Detected
+    └─ BulkCheckService     batches, ticks, queue handoff
+    ▼
+MySQL
+    users
+    check_batches   (job: type, totals, last_tick_at, queue_handoff_at)
+    check_items     (one row per domain: queued → checking → completed|failed + JSON payload)
+    jobs            (Laravel queue)
+```
+
+**Request flow**
+
+1. Guest hits `/` and is sent to login. Only an authenticated admin can open tools or call check endpoints.
+2. A **single check** creates a one-row batch and runs the lookup in that HTTP request so the result drawer can open immediately.
+3. A **bulk upload** stores every line as `check_items` with status `queued`, returns the batch JSON, and lets the browser drive progress with `/tick`.
+4. Each tick claims **one** domain, runs DNS/blacklist or provider detection, writes the JSON payload, updates counters, and returns the full batch so the table can paint that row.
+5. Closing the tab calls `/handoff`. Remaining rows are processed by `ProcessCheckBatchRemainderJob` on the database queue. If the beacon never fires, `mailin:handoff-stale` (every minute) does the same after 45 seconds without ticks.
+
+Results are durable in MySQL. Reloading the tool or opening **Previous jobs** shows stored payloads (filters, details, CSV export).
+
+---
+
+## Technology choices and why
+
+| Choice | Why |
+| --- | --- |
+| **Laravel 13** | Auth, validation (Form Requests), queues, scheduler, migrations, and rate limiting are first-class. Fits an admin tool that must persist bulk jobs. |
+| **PHP 8.3 + `dns_get_record`** | Domain checks are DNS-heavy. PHP can query MX/TXT/RBL without a second language or paid DNS API. Timeouts map to `default_socket_timeout`. |
+| **Inertia + React** | One repo, one session cookie, no CORS/JWT SPA. Pages are React; mutations that need live tables use `fetch` + JSON. |
+| **Tailwind CSS 4** | Fast UI for tables, filters, and the domain-themed layout without a separate design system. |
+| **MySQL 8** | Required for this project. Batches, items, sessions, cache, and the `jobs` table stay in one engine. SQLite is not used for the app. |
+| **Database queue** | `QUEUE_CONNECTION=database` needs no Redis for WAMP. Same MySQL the app already has. Live servers can keep this or move to Redis later. |
+| **HTTP ticks for bulk while the tab is open** | The spec asks for rows to appear as each domain finishes. A long `queue:work` job would complete many domains before the UI saw them. Ticks return after **one** lookup. |
+| **Queue after tab close** | Browsers cannot keep ticking. Jobs + worker (and a scheduler fallback) finish the list without the user watching. |
+| **No public registration** | Spec is an internal operator tool. Seeded admin + session login is enough. |
+
+Alternatives considered and not used for the first version: a split Laravel API + Vite SPA (more auth/CORS work), Redis queues (extra service on WAMP), and a hosted DNS API (cost, keys, and less control over DNSBL queries).
+
+---
+
+## How bulk processing and concurrency are handled
+
+**Cap:** `MAILIN_BULK_MAX_ITEMS` (default **5000**) in `config/mailin.php`. Duplicate lines are collapsed. Invalid lines become `failed` with an error; they do not stop the batch.
+
+**Concurrency while the tab is open**
+
+- `MAILIN_BULK_CONCURRENCY` is **1**.
+- `/tick` calls `advanceOne()` / `processNext()` so only one domain is in `checking` at a time.
+- The React loop waits for that HTTP response, updates the table, then ticks again. Slow DNS cannot overlap and freeze the UI behind several in-flight lookups.
+- Rate limit: `MAILIN_RATE_LIMIT` (default 60 checks/minute per user; bulk uploads use a tighter cap).
+
+This meets “do not wait for the entire file” and “show Queued → Checking → Completed/Failed” without opening dozens of DNS sockets at once (which would overload PHP and upstream resolvers).
+
+**Concurrency after the tab closes**
+
+- Handoff dispatches `ProcessCheckBatchRemainderJob`.
+- That job processes **one** leftover item, then dispatches itself again until none remain.
+- A live server should run a **persistent** `queue:work` (Supervisor). Locally, `QueueWorkerLauncher` may spawn `queue:work --stop-when-empty`.
+- Job timeout is 90–120 seconds so one hung DNSBL does not kill the worker; `tries=3` retries the job.
+
+**Why not unbounded parallel DNS?** A 1,000-row CSV with 12 RBLs per IP would stampede the resolver and the app. One-at-a-time is the safe default. Production could raise concurrency with multiple queue workers (`numprocs`) **if** DNS rate limits are respected.
+
+---
+
+## How DNS timeouts and retries are handled
+
+Configured in `.env` / `config/mailin.php`:
+
+- `MAILIN_DNS_TIMEOUT` — default **3** seconds (`ini_set('default_socket_timeout')` around lookups).
+- `MAILIN_DNS_RETRIES` — default **2** attempts per query.
+
+In `DnsLookupService`:
+
+- `dns_get_record` returning **`false`** is treated as timeout/resolver failure. Empty array `[]` means “no records of that type” (not an error).
+- On `false`, the code waits `150ms * attempt` and retries up to `dns_retries`.
+- If all attempts fail, the error is stored on the result (`errors` / “Errors / timeouts” in the UI) and that record type is returned as empty. The rest of the check still runs (MX can succeed even if one RBL times out).
+- DKIM uses a small selector list (`google`, `selector1`, …) unless the operator supplies a selector. Provider detection **skips DKIM** so bulk MX classification stays faster.
+- Blacklist IP checks use at most **two** A records and a 2-second socket timeout so one domain does not sit on 12 lists × many IPs.
+
+Failed domains are marked `failed` with the exception message; timeouts inside a successful payload stay in `payload.errors` so the row can still be **Completed** with partial data.
+
+---
+
+## How Google Workspace / Microsoft 365 detection works
+
+Detection is **public DNS only** (no Google/Microsoft login, no Admin SDK). Implemented in `MailProviderDetector` after `DnsLookupService` loads MX and TXT/SPF.
+
+**Signals**
+
+| Signal | Treated as |
+| --- | --- |
+| MX host is `google.com` / `googlemail.com` or a subdomain (e.g. `aspmx.l.google.com`) | Google Workspace |
+| MX host is `mail.protection.outlook.com` or `protection.outlook.com` (or a subdomain) | Microsoft 365 |
+| SPF/TXT contains `_spf.google.com` | Supporting Google evidence |
+| SPF/TXT contains `include:spf.protection.outlook.com` | Supporting Microsoft evidence |
+
+**Decision order**
+
+1. Google MX, or Google SPF when there is **no** Microsoft MX → **Google Workspace**, status **Active/Detected**.
+2. Else Microsoft MX or Microsoft SPF → **Microsoft 365**, status **Active/Detected**.
+3. Else any other MX → **Other**, status **Active/Detected**, evidence that MX exists but is not Google/Microsoft.
+4. Else no MX → **Not Detected**, status **Not Detected**.
+5. If **both** Google and Microsoft MX exist → **Other** (conflict), do not guess.
+
+The UI and CSV show exactly: **Domain**, **Provider**, **MX records found** (host + priority), **Detection evidence/reason**, **Status** (`Active/Detected` or `Not Detected`).
+
+This is an **appearance** check from MX/SPF. It cannot prove a Workspace licence is paid or that mailboxes exist. Consumer `gmail.com` still classifies as Google because MX points at Google.
+
+---
+
+## What we would improve or change for a production deployment
+
+These are intentional follow-ups, not blockers for the task:
+
+1. **Always-on queue + scheduler** — Supervisor `queue:work` and cron `schedule:run` (already documented above). Do not depend on spawning PHP from the web request.
+2. **Redis (or SQS) queue** — Better than the `jobs` table under large bulk load; still keep MySQL for domain results.
+3. **Parallel workers with a global DNS budget** — `numprocs=2–4` plus a Redis rate limiter so RBLs are not flooded.
+4. **Dedicated DNS resolver** — Unbound/Bind or a DNS-over-HTTPS library instead of the server’s recursive resolver (Spamhaus and others often block open resolvers).
+5. **Auth** — SSO (Google/Microsoft), 2FA, password reset, hashed admin invite, audit log of who ran which bulk file.
+6. **Observability** — Horizon or a simple failed-job dashboard, metrics for tick duration, RBL timeouts, and batch age.
+7. **Caching** — Short TTL cache of DNS/RBL for the same domain (e.g. 15 minutes) to make re-checks cheap.
+8. **Richer provider signals** — Autodiscover CNAME, `verify.zoho.com`, SPF includes for Fastmail/Proofpoint; optional BIMI. Keep MX as the primary rule.
+9. **HTTPS, `APP_DEBUG=false`, hardened headers**, backups of MySQL, and a staging clone of `mailin`.
+10. **Front-end build in CI** — `npm run build` in the pipeline; never run Vite in production.
+
+The current design (ticks for live UI, queue for closed tabs, MySQL as source of truth) should stay. Production work is mostly **ops** (workers, DNS path, auth) and **scale** (cache, Redis, more workers), not a rewrite.
+
+
+## How the application run locally:
+
+see above after this head line ## Required software versions you will get version and installation info.
