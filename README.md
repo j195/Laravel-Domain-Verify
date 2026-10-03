@@ -594,4 +594,7 @@ The current design (ticks for live UI, queue for closed tabs, MySQL as source of
 
 ## How the application run locally:
 
-see above after this head line ## Required software versions you will get version and installation info.
+see above after this head line ## Required software versions you will get version and installation info. Also provided Admin user login credentials as below
+
+- Email: `admin@mailin.test`
+- Password: `Mailin@Admin123`
