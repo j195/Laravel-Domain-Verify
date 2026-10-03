@@ -1,0 +1,46 @@
+@import 'tailwindcss';
+
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../storage/framework/views/*.php';
+@source '../**/*.jsx';
+@source '../**/*.js';
+
+@theme {
+    --font-sans: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+    --font-display: 'Syne', ui-sans-serif, system-ui, sans-serif;
+    --color-ink: #06131f;
+    --color-panel: #0b1d30;
+    --color-line: #1b3b57;
+    --color-cyan: #3ee0c9;
+    --color-cyan-dim: #1aa392;
+    --color-amber: #f5c16c;
+    --color-rose: #ff6b8a;
+}
+
+html,
+body,
+#app {
+    min-height: 100%;
+}
+
+body {
+    color: #d7e7f5;
+    background:
+        radial-gradient(1200px 600px at 10% -10%, rgba(62, 224, 201, 0.16), transparent 55%),
+        radial-gradient(900px 500px at 110% 10%, rgba(56, 132, 255, 0.16), transparent 50%),
+        linear-gradient(180deg, #06131f 0%, #082033 100%);
+    background-attachment: fixed;
+}
+
+.domain-grid {
+    background-image:
+        linear-gradient(rgba(62, 224, 201, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(62, 224, 201, 0.06) 1px, transparent 1px);
+    background-size: 42px 42px;
+}
+
+.globe-ring {
+    box-shadow:
+        0 0 0 1px rgba(62, 224, 201, 0.25),
+        0 0 40px rgba(62, 224, 201, 0.12);
+}
